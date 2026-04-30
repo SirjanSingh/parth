@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pdf
+models/
+results/
+*.npz
+*.png
