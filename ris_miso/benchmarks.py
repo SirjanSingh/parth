@@ -35,19 +35,29 @@ def zf_beamformer(H_eff: np.ndarray, Pt: float) -> np.ndarray:
     return _normalize_beamformer(G, Pt)
 
 
-def _bisect_mu(A: np.ndarray, rhs: np.ndarray, Pt: float) -> float:
-    """Find Lagrange multiplier mu so that tr(G G^H) = Pt via bisection."""
+def _solve_with_mu(lam: np.ndarray, U: np.ndarray, Uhr: np.ndarray,
+                   norms_sq: np.ndarray, Pt: float) -> np.ndarray:
+    """
+    Bisect on mu using the eigendecomposition of A (precomputed once per WMMSE iter).
+    A = U @ diag(lam) @ U^H  →  (A + mu*I)^{-1} = U @ diag(1/(lam+mu)) @ U^H
+
+    tr(G G^H) = sum_i  norms_sq[i] / (lam[i] + mu)^2
+
+    This replaces 60 × np.linalg.solve calls with 60 scalar evaluations.
+    Returns G = (A + mu*I)^{-1} @ rhs.
+    """
     lo, hi = 0.0, 1e8
     for _ in range(60):
         mu = (lo + hi) / 2.0
-        G = np.linalg.solve(A + mu * np.eye(A.shape[0]), rhs)
-        if np.real(np.trace(G @ G.conj().T)) > Pt:
+        power = np.sum(norms_sq / (lam + mu) ** 2)
+        if power > Pt:
             lo = mu
         else:
             hi = mu
-        if hi - lo < 1e-5:
+        if hi - lo < 1e-4:
             break
-    return (lo + hi) / 2.0
+    mu_star = (lo + hi) / 2.0
+    return U @ (Uhr / np.maximum(lam + mu_star, 1e-12)[:, None])
 
 
 def wmmse_beamformer(H_eff: np.ndarray, Pt: float, sigma2: float,
@@ -66,23 +76,24 @@ def wmmse_beamformer(H_eff: np.ndarray, Pt: float, sigma2: float,
         total_rx = np.sum(np.abs(HG) ** 2, axis=1) + sigma2  # (K,)
 
         # MMSE receiver scalars
-        u = np.diag(HG) / total_rx                        # (K,)
+        u = np.diag(HG) / (total_rx + 1e-12)             # (K,)
 
         # MSE weights
         e = np.real(1.0 - np.conj(u) * np.diag(HG))
         e = np.maximum(e, 1e-8)
         w = 1.0 / e                                       # (K,)
 
-        # Build Hessian A and RHS
-        A = np.zeros((M, M), dtype=complex)
-        rhs = np.zeros((M, K), dtype=complex)
-        for k in range(K):
-            hk = H_eff[k].reshape(M, 1)
-            A += w[k] * (np.abs(u[k]) ** 2) * (hk @ hk.conj().T)
-            rhs[:, k] = w[k] * np.conj(u[k]) * hk.flatten()
+        # Build Hessian A and RHS — vectorised (no Python loop over K)
+        wu2 = w * np.abs(u) ** 2                                  # (K,)
+        A   = (H_eff * wu2[:, None]).conj().T @ H_eff             # (M, M)
+        rhs = H_eff.conj().T * (w * np.conj(u))[np.newaxis, :]   # (M, K)
 
-        mu = _bisect_mu(A, rhs, Pt)
-        G = np.linalg.solve(A + mu * np.eye(M), rhs)
+        # Eigendecompose A once; bisect in O(M) per iter instead of O(M^3)
+        lam, U = np.linalg.eigh(A)                               # (M,), (M,M)
+        lam    = np.maximum(lam, 1e-12)                          # numerical safety
+        Uhr    = U.conj().T @ rhs                                # (M, K)
+        norms_sq = np.sum(np.abs(Uhr) ** 2, axis=1)             # (M,)
+        G = _solve_with_mu(lam, U, Uhr, norms_sq, Pt)
 
     return G
 

@@ -2,8 +2,6 @@
 # All parameters in one place. Modify here to change experiment.
 # ============================================================
 
-import numpy as np
-
 # --- System (Part A: reproduce Fig 5) ---
 M = 64          # BS antennas
 K = 64          # Users  (change both to 256 for Part B)
@@ -20,9 +18,9 @@ seed = 42
 
 # --- Benchmark optimization ---
 wmmse_max_iter = 50              # WMMSE inner iterations
-phase_opt_steps = 200            # gradient steps for phase optimization
+phase_opt_steps = 50             # gradient steps per outer iteration (was 200 — 50 is sufficient)
 phase_opt_lr = 0.05              # Adam lr for phase optimization
-num_outer_alternating = 5        # outer alternating iterations (WMMSE / FP+ZF)
+num_outer_alternating = 3        # outer alternating iterations (was 5 — 3 is sufficient)
 
 # --- DDPG hyperparameters (from paper) ---
 discount = 0.99
