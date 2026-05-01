@@ -25,13 +25,17 @@ def _normalize_beamformer(G: np.ndarray, Pt: float) -> np.ndarray:
     return G * np.sqrt(Pt / (power + 1e-12))
 
 
-def zf_beamformer(H_eff: np.ndarray, Pt: float) -> np.ndarray:
-    """Zero-Forcing: G = H_eff^H (H_eff H_eff^H)^{-1}, normalized."""
-    try:
-        G = H_eff.conj().T @ np.linalg.inv(H_eff @ H_eff.conj().T)   # (M, K)
-    except np.linalg.LinAlgError:
-        M, K = H_eff.shape[1], H_eff.shape[0]
-        G = (np.random.randn(M, K) + 1j * np.random.randn(M, K)) / np.sqrt(2)
+def zf_beamformer(H_eff: np.ndarray, Pt: float, sigma2: float = 1.0) -> np.ndarray:
+    """
+    Regularized ZF (MMSE) beamformer: G = H^H (H H^H + K*sigma2/Pt * I)^{-1}, normalized.
+
+    Pure ZF (no regularization) requires rank(H_eff) >= K, which fails when N < K
+    because rank(H_eff) = min(N, K, M) = N.  The regularized version handles all cases
+    gracefully and equals ZF in the high-SNR limit.
+    """
+    K = H_eff.shape[0]
+    reg = K * sigma2 / (Pt + 1e-12)
+    G = H_eff.conj().T @ np.linalg.inv(H_eff @ H_eff.conj().T + reg * np.eye(K))
     return _normalize_beamformer(G, Pt)
 
 
@@ -68,8 +72,8 @@ def wmmse_beamformer(H_eff: np.ndarray, Pt: float, sigma2: float,
     """
     K, M = H_eff.shape
 
-    # Init with ZF (already power-normalized)
-    G = zf_beamformer(H_eff, Pt)
+    # Init with regularized ZF / MMSE (handles rank-deficient H_eff when N < K)
+    G = zf_beamformer(H_eff, Pt, sigma2)
 
     for _ in range(num_iter):
         HG = H_eff @ G                                    # (K, K)
@@ -108,12 +112,14 @@ def _optimize_phases_gradient(
     G: np.ndarray,
     sigma2: float,
     N: int,
+    phases_init: np.ndarray,          # ← warm-start from caller
     num_steps: int = 200,
     lr: float = 0.05,
     device: str = "cpu",
 ) -> np.ndarray:
     """
     Maximize sum rate over RIS phase angles theta_n using Adam gradient ascent.
+    Warm-starts from phases_init so the alternating loop makes progress each call.
     Returns phases (N,) in radians.
     """
     dev = torch.device(device)
@@ -123,9 +129,9 @@ def _optimize_phases_gradient(
     G_t  = torch.tensor(G,  dtype=torch.complex64, device=dev)  # (M, K)
     s2   = torch.tensor(sigma2, dtype=torch.float32, device=dev)
 
-    # Learnable phases
+    # Warm-start from provided phases (crucial for alternating convergence)
     theta = torch.nn.Parameter(
-        torch.rand(N, device=dev) * 2 * np.pi
+        torch.tensor(phases_init, dtype=torch.float32, device=dev)
     )
     optimizer = torch.optim.Adam([theta], lr=lr)
 
@@ -165,13 +171,14 @@ def run_wmmse(H1: np.ndarray, H2: np.ndarray, Pt: float, sigma2: float,
     """
     N = H1.shape[0]
     device = _get_device()
-    phases = np.random.uniform(0, 2 * np.pi, N)
+    phases = np.random.uniform(0, 2 * np.pi, N)   # random init once
 
     for _ in range(num_outer):
         Phi   = build_phi(phases)
         H_eff = compute_effective_channel(H1, H2, Phi)
         G     = wmmse_beamformer(H_eff, Pt, sigma2, num_iter=wmmse_iter)
         phases = _optimize_phases_gradient(H1, H2, G, sigma2, N,
+                                           phases_init=phases,          # warm-start
                                            num_steps=phase_steps, lr=phase_lr,
                                            device=device)
 
@@ -184,18 +191,19 @@ def run_fp_zf(H1: np.ndarray, H2: np.ndarray, Pt: float, sigma2: float,
               num_outer: int = 5, phase_steps: int = 200,
               phase_lr: float = 0.05) -> float:
     """
-    Alternating: ZF for G  ↔  gradient ascent for phases (FP-style).
+    Alternating: regularized ZF (MMSE) for G  ↔  gradient ascent for phases.
     Returns final sum rate.
     """
     N = H1.shape[0]
     device = _get_device()
-    phases = np.random.uniform(0, 2 * np.pi, N)
+    phases = np.random.uniform(0, 2 * np.pi, N)   # random init once
 
     for _ in range(num_outer):
         Phi   = build_phi(phases)
         H_eff = compute_effective_channel(H1, H2, Phi)
-        G     = zf_beamformer(H_eff, Pt)
+        G     = zf_beamformer(H_eff, Pt, sigma2)
         phases = _optimize_phases_gradient(H1, H2, G, sigma2, N,
+                                           phases_init=phases,          # warm-start
                                            num_steps=phase_steps, lr=phase_lr,
                                            device=device)
 
