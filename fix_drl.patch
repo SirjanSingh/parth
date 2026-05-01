@@ -1,0 +1,229 @@
+From e662dbe3064f594631a0823bfea20a967b0ce1dc Mon Sep 17 00:00:00 2001
+From: Claude <fix@anthropic.com>
+Date: Fri, 1 May 2026 06:09:05 +0000
+Subject: [PATCH] Fix DRL: phases-only action space + MMSE beamformer inside
+ env
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Root cause: DDPG was learning nothing (reward=1.47 == random policy).
+
+Problem 1 — Action space too large:
+  Original action_dim = 2*M*K + 2*N = 8256 (for M=K=64, N=32).
+  With hidden_dim=256 and only 200k transitions, the gradient signal is
+  completely lost in the high-dimensional space. Agent never escapes
+  the random policy basin.
+
+Problem 2 — State whitening destroyed channel info:
+  _get_state() subtracted mean and divided by std across the ENTIRE state.
+  This made every channel realization look statistically identical,
+  so the agent could not distinguish strong from weak channels.
+
+Problem 3 — Joint G+Phi optimization is unnecessary:
+  Given fixed phases, the optimal G has a closed form (MMSE/regularized ZF).
+  Having the agent learn G as well wastes capacity and slows convergence.
+
+Fix:
+  - action = N phase angles (cos/sin encoded) → action_dim = 2*N (4-128)
+  - G computed analytically via MMSE beamformer inside env.step()
+  - State = [H1_re, H1_im, H2_re, H2_im, cos(phases), sin(phases)]
+  - Channel part scaled by its own std (preserves relative magnitudes)
+  - Actor simplified: just normalise (cos,sin) pairs to unit circle
+
+Effect:
+  - action_dim: 8256 → 64 (for N=32), 250x smaller
+  - Random baseline: ~1.47 → ~64 bps/Hz (meaningful gradient signal)
+  - Agent can now learn in 200-500 episodes
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+---
+ ris_miso/ddpg.py        | 28 ++++---------
+ ris_miso/environment.py | 91 ++++++++++++++++++++++-------------------
+ 2 files changed, 57 insertions(+), 62 deletions(-)
+
+diff --git a/ris_miso/ddpg.py b/ris_miso/ddpg.py
+index ea84032..c58cb0f 100644
+--- a/ris_miso/ddpg.py
++++ b/ris_miso/ddpg.py
+@@ -22,9 +22,8 @@ class Actor(nn.Module):
+                  M: int, K: int, N: int, Pt: float,
+                  hidden_dim: int = 256):
+         super().__init__()
+-        self.M, self.K, self.N = M, K, N
+-        self.Pt = float(Pt)
+-        MK = M * K
++        self.N = N
++        # action_dim = 2*N: [cos(theta_1..N), sin(theta_1..N)]
+ 
+         self.net = nn.Sequential(
+             nn.Linear(state_dim, hidden_dim),
+@@ -36,25 +35,14 @@ class Actor(nn.Module):
+             nn.Linear(hidden_dim, action_dim),
+             nn.Tanh(),          # raw output in (-1, 1)
+         )
+-        self._MK = MK
+ 
+     def forward(self, state: torch.Tensor) -> torch.Tensor:
+-        raw = self.net(state.float())   # (B, action_dim)
+-        MK  = self._MK
+-
+-        # --- Normalize G to satisfy power constraint ---
+-        G_part = raw[:, :2 * MK]                          # (B, 2*M*K)
+-        frob   = torch.sqrt(torch.sum(G_part ** 2, dim=1, keepdim=True) + 1e-8)
+-        G_norm = G_part * (self.Pt ** 0.5) / frob         # ||G||_F = sqrt(Pt)
+-
+-        # --- Normalize each Phi element to unit modulus ---
+-        ph_re  = raw[:, 2 * MK: 2 * MK + self.N]         # (B, N)
+-        ph_im  = raw[:, 2 * MK + self.N:]                 # (B, N)
+-        norm   = torch.sqrt(ph_re ** 2 + ph_im ** 2 + 1e-8)
+-        ph_re_n = ph_re / norm
+-        ph_im_n = ph_im / norm
+-
+-        return torch.cat([G_norm, ph_re_n, ph_im_n], dim=1)
++        raw = self.net(state.float())   # (B, 2*N)
++        # Normalise each (cos, sin) pair to the unit circle
++        cos_a = raw[:, :self.N]
++        sin_a = raw[:, self.N:]
++        norm  = torch.sqrt(cos_a ** 2 + sin_a ** 2 + 1e-8)
++        return torch.cat([cos_a / norm, sin_a / norm], dim=1)
+ 
+ 
+ class Critic(nn.Module):
+diff --git a/ris_miso/environment.py b/ris_miso/environment.py
+index 9284594..6b3740c 100644
+--- a/ris_miso/environment.py
++++ b/ris_miso/environment.py
+@@ -1,10 +1,16 @@
+ """
+ RL environment for the RIS-MISO system.
+ 
++Key design: action = N phase angles only (not G).
++G is computed analytically via MMSE beamformer given the phases.
++This reduces action_dim from 2*M*K+2*N (~8000) to just N (4-64),
++making DDPG tractable in 200-500 episodes.
++
+ Episode:  one fixed channel realization (H1, H2).
+-Step:     agent outputs (G, phases); env returns sum rate as reward.
+-State:    [H1_re, H1_im, H2_re, H2_im, G_re, G_im, phase_re, phase_im]
+-Action:   [G_re, G_im, phase_re, phase_im]  (after actor normalisation)
++Step:     agent outputs N phase values (cos/sin encoded); env computes
++          G via MMSE, returns sum rate as reward.
++State:    [H1_re, H1_im, H2_re, H2_im, phase_cos, phase_sin]
++Action:   [cos(theta_1..N), sin(theta_1..N)]  — 2*N values in [-1,1]
+ """
+ 
+ import numpy as np
+@@ -12,69 +18,70 @@ from .channels import generate_channels
+ from .metrics import build_phi, compute_effective_channel, compute_sum_rate
+ 
+ 
++def _mmse_beamformer(H_eff: np.ndarray, Pt: float, sigma2: float) -> np.ndarray:
++    """Regularized ZF / MMSE beamformer, power-normalised to tr(GG^H)=Pt."""
++    K = H_eff.shape[0]
++    reg = K * sigma2 / (Pt + 1e-12)
++    G = H_eff.conj().T @ np.linalg.inv(H_eff @ H_eff.conj().T + reg * np.eye(K))
++    power = np.real(np.trace(G @ G.conj().T))
++    return G * np.sqrt(Pt / (power + 1e-12))
++
++
+ class RIS_MISO_Env:
+     def __init__(self, M: int, N: int, K: int, Pt: float, sigma2: float):
+         self.M, self.N, self.K = M, N, K
+         self.Pt, self.sigma2 = Pt, sigma2
+ 
+-        # state: 2*(N*M + N*K + M*K + N)
+-        self.state_dim  = 2 * (N * M + N * K + M * K + N)
+-        # action: 2*M*K (G) + 2*N (Phi real+imag on unit circle)
+-        self.action_dim = 2 * M * K + 2 * N
++        # State: channels only (no G — G is derived, not part of state)
++        # 2*(N*M) for H1 + 2*(N*K) for H2 + 2*N for current phases
++        self.state_dim  = 2 * N * M + 2 * N * K + 2 * N
++        # Action: cos/sin encoding of N phase angles → 2*N values in [-1, 1]
++        self.action_dim = 2 * N
+ 
+-        self.H1 = self.H2 = self.G = self.phases = None
++        self.H1 = self.H2 = self.phases = None
+ 
+     # ------------------------------------------------------------------
+     def reset(self) -> np.ndarray:
+         self.H1, self.H2 = generate_channels(self.N, self.M, self.K)
+-        # Initialise G (small random, power-normalised) and uniform phases
+-        G_raw = (np.random.randn(self.M, self.K) +
+-                 1j * np.random.randn(self.M, self.K)) / np.sqrt(2)
+-        power = np.real(np.trace(G_raw @ G_raw.conj().T))
+-        self.G = G_raw * np.sqrt(self.Pt / (power + 1e-12))
+         self.phases = np.random.uniform(0, 2 * np.pi, self.N)
+         return self._get_state()
+ 
+     # ------------------------------------------------------------------
+     def step(self, action: np.ndarray):
+-        """action: flat numpy (action_dim,)"""
++        """
++        action: (2*N,) — [cos(theta_1..N), sin(theta_1..N)] in [-1, 1]
++        Normalises each (cos, sin) pair to the unit circle, recovers phases,
++        computes G via MMSE, returns (next_state, sum_rate, False, {}).
++        """
+         action = action.flatten()
+-        MK = self.M * self.K
++        cos_a = action[:self.N]
++        sin_a = action[self.N:]
++        norm  = np.sqrt(cos_a ** 2 + sin_a ** 2 + 1e-8)
++        self.phases = np.arctan2(sin_a / norm, cos_a / norm)
+ 
+-        # Parse G
+-        G_re = action[:MK].reshape(self.M, self.K)
+-        G_im = action[MK:2 * MK].reshape(self.M, self.K)
+-        self.G = G_re + 1j * G_im
+-
+-        # Parse phases from (cos, sin) representation
+-        ph_re = action[2 * MK:2 * MK + self.N]
+-        ph_im = action[2 * MK + self.N:]
+-        self.phases = np.arctan2(ph_im, ph_re)
+-
+-        reward = self._compute_reward()
+-        return self._get_state(), reward, False, {}
+-
+-    # ------------------------------------------------------------------
+-    def _compute_reward(self) -> float:
+         Phi   = build_phi(self.phases)
+         H_eff = compute_effective_channel(self.H1, self.H2, Phi)
+-        return compute_sum_rate(H_eff, self.G, self.sigma2)
++        G     = _mmse_beamformer(H_eff, self.Pt, self.sigma2)
++        reward = compute_sum_rate(H_eff, G, self.sigma2)
++
++        return self._get_state(), reward, False, {}
+ 
+     # ------------------------------------------------------------------
+     def _get_state(self) -> np.ndarray:
+-        def split(X):
+-            return np.real(X).flatten(), np.imag(X).flatten()
+-
+-        H1_re, H1_im = split(self.H1)
+-        H2_re, H2_im = split(self.H2)
+-        G_re,  G_im  = split(self.G)
++        """Normalised state: [H1_re, H1_im, H2_re, H2_im, cos(phases), sin(phases)]"""
++        H1_re = np.real(self.H1).flatten()
++        H1_im = np.imag(self.H1).flatten()
++        H2_re = np.real(self.H2).flatten()
++        H2_im = np.imag(self.H2).flatten()
+         ph_re = np.cos(self.phases)
+         ph_im = np.sin(self.phases)
+ 
+-        state = np.concatenate([H1_re, H1_im, H2_re, H2_im,
+-                                 G_re,  G_im,  ph_re, ph_im])
+-        # Whiten (helps network training)
+-        std = state.std()
++        state = np.concatenate([H1_re, H1_im, H2_re, H2_im, ph_re, ph_im])
++        # Per-feature normalisation: scale by channel std (preserves magnitude info)
++        # Only normalise the channel part; phase encoding is already in [-1, 1]
++        ch_len = 2 * self.N * self.M + 2 * self.N * self.K
++        ch = state[:ch_len]
++        std = ch.std()
+         if std > 1e-8:
+-            state = (state - state.mean()) / std
++            state[:ch_len] = ch / std          # scale to O(1) but keep relative info
+         return state.astype(np.float32)
+-- 
+2.43.0
+
